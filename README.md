@@ -226,3 +226,4 @@ BC_01 generate
 ```
 
 Master Agent Pack ยังใช้ได้สำหรับ batch แต่ Sequential Fidelity Mode จะต่อเนื่องกว่าเพราะใช้ผลลัพธ์จริงของคลิปก่อนหน้า
+"# affiliate-video-studio-v0.1" 
