@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="theme-color" content="#171713" />
+  <title>BasketClip Director v0.6.3</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <div class="logo">B</div>
+    <div><strong>BasketClip Director</strong><small>Category-aware Fidelity System · v0.6.3</small></div>
+  </div>
+  <div class="top-status"><span></span> Category-aware product reference workflow</div>
+</header>
+
+<main class="layout">
+  <aside class="sidebar">
+    <section>
+      <div class="eyebrow">01 · CATEGORY FIRST</div>
+      <h2>เลือกหมวดก่อน แล้วค่อยใส่รูป</h2>
+      <p class="muted">แต่ละหมวดจะใช้ภาพอ้างอิงไม่เหมือนกัน เพื่อให้เข้าใจสินค้าได้เหมาะกับจริงมากขึ้น</p>
+
+      <div class="grid2">
+        <label><span>หมวดสินค้า</span>
+          <select id="category">
+            <option value="">— เลือกหมวดสินค้าก่อน —</option>
+            <option value="แฟชั่น/เครื่องแต่งกาย">แฟชั่น/เครื่องแต่งกาย</option>
+            <option value="เสื้อ">เสื้อ</option>
+            <option value="กางเกง">กางเกง</option>
+            <option value="เดรส">เดรส</option>
+            <option value="รองเท้า">รองเท้า</option>
+            <option value="กระเป๋า">กระเป๋า</option>
+            <option value="เครื่องประดับ">เครื่องประดับ</option>
+          </select>
+        </label>
+        <label><span>ชื่อสินค้า</span><input id="productName" placeholder="เช่น รองเท้าผ้าใบสีครีม / กระเป๋าสะพาย"/></label>
+      </div>
+
+      <div id="categoryGuide" class="info-box"></div>
+      <div id="productSlots" class="slot-stack"></div>
+
+      <label><span>ข้อมูลที่ยืนยันได้จริง</span><textarea id="facts" rows="3" placeholder="ราคา สี วัสดุ ไซซ์ ช่องเก็บของ หรือรายละเอียดจริงจากร้าน"></textarea></label>
+      <label><span>กลุ่มลูกค้า</span><input id="audience" placeholder="เช่น วัยเรียน/วัยทำงาน/สายมินิมอล"/></label>
+    </section>
+
+    <div class="rule"></div>
+
+    <section>
+      <div class="eyebrow">02 · PRESENTER & CREATIVE</div>
+      <h2>ผู้สวมใส่ / โทนคลิป</h2>
+      <div class="grid2">
+        <label><span>เพศผู้สวม/ผู้ใช้สินค้า</span>
+          <select id="presenterGender">
+            <option value="female">ผู้หญิง (Adult)</option>
+            <option value="male">ผู้ชาย (Adult)</option>
+            <option value="neutral">Gender-neutral (Adult)</option>
+            <option value="unspecified">ไม่เน้นเพศ (Adult)</option>
+          </select>
+        </label>
+        <label><span>จำนวนคลิป</span>
+          <select id="clipCount"><option value="3">3 · 24 วิ</option><option value="4" selected>4 · 32 วิ</option><option value="5">5 · 40 วิ</option></select>
+        </label>
+      </div>
+      <label><span>มุมขาย</span>
+        <select id="angle">
+          <option value="trust">Trust-first · รีวิวจริงใจ</option>
+          <option value="conversion">Conversion-first · เน้นขาย</option>
+          <option value="aesthetic">Aesthetic-first · ภาพแฟชั่น</option>
+          <option value="detail">Detail-first · เน้นรายละเอียด</option>
+        </select>
+      </label>
+      <label><span>โทน</span>
+        <select id="tone">
+          <option>จริงใจ กระชับ ดูเป็นธรรมชาติ</option>
+          <option>มินิมอล พรีเมียม</option>
+          <option>เป็นกันเอง สาย TikTok</option>
+          <option>เร็ว กระชับ เน้นรายละเอียด</option>
+        </select>
+      </label>
+      <label><span>Gemini model</span>
+        <select id="geminiModel">
+          <option value="gemini-3.5-flash-lite">Gemini 3.5 Flash-Lite</option>
+          <option value="gemini-3.6-flash">Gemini 3.6 Flash</option>
+          <option value="gemini-3.1-pro-preview">Gemini 3.1 Pro Preview</option>
+        </select>
+        <small id="modelStatus" class="model-status">กำลังตรวจรุ่น…</small>
+      </label>
+      <label class="toggle">
+        <input id="smartQa" type="checkbox" checked /><span class="toggle-ui"></span>
+        <div><b>Smart Continuity QA</b><small>ตรวจความต่อเนื่อง รายละเอียดสินค้า และบทบาทของภาพอ้างอิง</small></div>
+      </label>
+    </section>
+
+    <div class="rule"></div>
+
+    <section>
+      <div class="eyebrow">03 · CONTINUITY BRIDGE</div>
+      <h2>กำหนด transition ระหว่างคลิป</h2>
+      <p class="muted">คลิปที่ 2 เป็นต้นไปสามารถอัปโหลดภาพเฟรมสุดท้ายของคลิปก่อนหน้า แล้วให้ระบบเสริม prompt เพื่อให้เปิดฉากต่อเนื่องมากขึ้น และไม่ซูมเวียนหัวเกินจำเป็น</p>
+      <label><span>แนวทางการเคลื่อนกล้องตอนต่อคลิป</span>
+        <select id="continuityMotionPolicy">
+          <option value="minimal">นิ่งเป็นหลัก</option>
+          <option value="balanced">สมดุล</option>
+          <option value="counter_zoom">เน้น counter-zoom เมื่อเหมาะสม</option>
+        </select>
+      </label>
+      <div id="transitionPlanner" class="transition-planner"></div>
+    </section>
+
+    <div class="rule"></div>
+
+    <section>
+      <div class="eyebrow">04 · SCENE REFERENCES</div>
+      <h2>ภาพฉากที่ต้องแนบใน Flow</h2>
+      <p class="muted">คลิปยังใช้ 2 ฉากเหมือนเดิม: โต๊ะรีวิวก่อน แล้วค่อยไปฉากห้อง/การใช้งานจริง</p>
+
+      <div class="scene-stack">
+        <div class="scene-ref">
+          <img id="tableScenePreview" src="/scenes/table-review.png" />
+          <div><b>Scene A · โต๊ะรีวิว</b><small>ใช้กับคลิปรีวิวบนโต๊ะ</small>
+            <div class="mini-actions"><label class="mini-btn">เปลี่ยนภาพ<input id="tableSceneInput" type="file" accept="image/*" hidden /></label><a class="mini-btn" href="/scenes/table-review.png" download>ดาวน์โหลด</a></div>
+          </div>
+        </div>
+        <div class="scene-ref">
+          <img id="roomScenePreview" src="/scenes/room-review.png" />
+          <div><b>Scene B · ห้องรีวิว / ลองใช้จริง</b><small>ใช้กับคลิปสวมใส่/ถือ/ใช้งานจริง</small>
+            <div class="mini-actions"><label class="mini-btn">เปลี่ยนภาพ<input id="roomSceneInput" type="file" accept="image/*" hidden /></label><a class="mini-btn" href="/scenes/room-review.png" download>ดาวน์โหลด</a></div>
+          </div>
+        </div>
+      </div>
+
+      <button id="analyzeBtn" class="primary" type="button"><span>1. วิเคราะห์สินค้า + สร้าง Hook Lab</span><kbd>Stage 1</kbd></button>
+      <p class="fine">ขั้นนี้ยังไม่สร้าง Prompt วิดีโอ ต้องเลือก Hook ก่อน</p>
+    </section>
+  </aside>
+
+  <section class="main">
+    <div class="hero">
+      <div>
+        <div class="eyebrow">CATEGORY-AWARE FIDELITY</div>
+        <h1>หมวดต่างกัน → รูปอ้างอิงต่างกัน → Prompt ต่างกัน</h1>
+        <p>v0.6.2 เพิ่ม Continuity Bridge: เลือก transition ระหว่างคลิป, แนบเฟรมสุดท้ายของคลิปก่อนหน้า, แล้วเสริม prompt ให้คลิปถัดไปต่อกันเนียนขึ้น</p>
+      </div>
+      <div class="hero-actions">
+        <button id="exportPackBtn" class="ghost" disabled>Export Flow Agent Pack</button>
+        <button id="exportJsonBtn" class="ghost" disabled>Export JSON</button>
+      </div>
+    </div>
+
+    <div id="progressBar" class="progressbar">
+      <div class="progress-step active" data-step="1"><b>1</b><span>Analyze</span></div><i></i>
+      <div class="progress-step" data-step="2"><b>2</b><span>Select Hook</span></div><i></i>
+      <div class="progress-step" data-step="3"><b>3</b><span>Build Prompts</span></div>
+    </div>
+
+    <div id="emptyState" class="empty">
+      <div class="spark">✦</div>
+      <h3>เริ่มจากเลือกหมวด</h3>
+      <p>ระบบจะสร้างชุดช่องอัปโหลดให้เหมาะกับสินค้าแต่ละประเภท แล้วค่อยวิเคราะห์ Product Fingerprint, Reference Role Map และ Hook Lab ก่อนสร้าง Production Prompts</p>
+    </div>
+
+    <div id="loading" class="loading hidden"><div class="spinner"></div><b id="loadingTitle">กำลังวิเคราะห์…</b><span id="loadingSub">Product Fingerprint + Reference Role Map</span></div>
+    <div id="analysisView" class="analysis-view hidden"></div>
+    <div id="projectView" class="project-view hidden"></div>
+  </section>
+</main>
+
+<div id="reviseModal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head"><b>แก้ช็อตโดยรักษา Product Lock</b><button id="closeModal">×</button></div>
+    <p id="reviseTitle"></p>
+    <textarea id="reviseInstruction" rows="4" placeholder="เช่น เน้นให้เห็นภายในกระเป๋าชัดขึ้น หรือให้ช็อตรองเท้าดูพื้นรองเท้าแบบยกขึ้นจริง"></textarea>
+    <button id="reviseSubmit" class="primary">แก้ Clip นี้</button>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+<script type="module" src="/app.js"></script>
+</body>
+</html>
