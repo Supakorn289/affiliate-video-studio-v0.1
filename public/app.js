@@ -128,6 +128,8 @@ const state = {
   reviseClipId:null,
   transitionPrefs:null,
   clipArtifacts:{},
+  apiBusy:false,
+  cooldownUntil:0,
 };
 
 const el = {
@@ -150,6 +152,37 @@ const el = {
   reviseInstruction: $("#reviseInstruction"),
   reviseSubmit: $("#reviseSubmit"),
 };
+
+function friendlyApiError(err){
+  const msg=String(err?.message||err||"");
+  if(msg.includes("429") || msg.includes("RATE LIMIT") || msg.includes("RATE_LIMIT")){
+    return msg.includes("ประมาณ") ? msg : "Gemini API ถึงขีดจำกัดอัตราการใช้งานชั่วคราว กรุณารอสักครู่แล้วลองใหม่ อย่ากดซ้ำถี่ ๆ";
+  }
+  if(msg.includes("503") || msg.includes("GEMINI_OVERLOADED") || msg.includes("โหลดสูง")){
+    return "Gemini ฝั่ง Google กำลังมีผู้ใช้งานสูงชั่วคราว ระบบลองซ้ำและสลับโมเดลให้อัตโนมัติแล้ว หากยังขึ้นข้อความนี้ให้รอ 30–60 วินาทีแล้วลองใหม่";
+  }
+  return msg.slice(0,260);
+}
+
+function setApiBusy(busy){
+  state.apiBusy=busy;
+  if(el.analyze) el.analyze.disabled = busy || !currentProfile();
+  const build=$("#buildBtn");
+  if(build) build.disabled = busy || !state.selectedHook;
+}
+
+function startCooldown(seconds){
+  const sec=Math.max(0,Number(seconds)||0);
+  if(!sec)return;
+  state.cooldownUntil=Date.now()+sec*1000;
+  const tick=()=>{
+    const left=Math.ceil((state.cooldownUntil-Date.now())/1000);
+    if(left<=0){state.cooldownUntil=0;return;}
+    toast(`Gemini rate limit · รออีกประมาณ ${left} วินาที แล้วค่อยลองใหม่`);
+    setTimeout(tick, Math.min(5000,left*1000));
+  };
+  tick();
+}
 
 function toast(msg){
   el.toast.textContent=msg;el.toast.classList.add("show");clearTimeout(toast.t);
@@ -209,7 +242,7 @@ function ensureClipArtifact(id){
 function saveCurrentProjectState(){
   try{
     if(!state.project) return;
-    localStorage.setItem("basketclip:v06:project",JSON.stringify({
+    localStorage.setItem("basketclip:v065:project",JSON.stringify({
       analysis:state.analysis,
       project:state.project,
       selectedHook:state.selectedHook,
@@ -274,7 +307,7 @@ function ensureProfileState(){
   if(!profile){ state.productRefs={}; return; }
   const next={};
   for(const slot of profile.slots){
-    next[slot.key]=state.productRefs[slot.key] || {fileName:"",dataUrl:null,note:""};
+    next[slot.key]=state.productRefs[slot.key] || {fileName:"",dataUrl:null,note:"",unavailable:false};
   }
   state.productRefs=next;
 }
@@ -291,48 +324,53 @@ function renderCategoryGuide(){
 function renderProductSlots(){
   ensureProfileState();
   const profile=currentProfile();
-  if(!profile){
-    el.productSlots.innerHTML="";
-    el.analyze.disabled=true;
-    return;
-  }
-  el.analyze.disabled=false;
-  el.productSlots.innerHTML = profile.slots.map(slot=>`
-    <div class="slot-card ${slot.priority||"optional"}">
+  if(!profile){ el.productSlots.innerHTML=""; el.analyze.disabled=true; return; }
+  el.analyze.disabled=state.apiBusy;
+  el.productSlots.innerHTML = profile.slots.map(slot=>{
+    const ref=state.productRefs[slot.key] || {fileName:"",dataUrl:null,note:"",unavailable:false};
+    return `
+    <div class="slot-card ${slot.priority||"optional"} ${ref.unavailable?"is-unavailable":""}">
       <div class="slot-head">
         <div><b>${esc(slot.labelTh)}</b><small>${esc(slot.helpTh)}</small></div>
         <span class="slot-badge">${esc(slot.badge)}</span>
       </div>
       <div class="slot-uploader">
         <div class="slot-preview" id="preview-${slot.key}">
-          ${state.productRefs[slot.key]?.dataUrl ? `<img src="${state.productRefs[slot.key].dataUrl}" alt="">` : `<span>${esc(slot.labelEn)}</span>`}
+          ${ref.dataUrl ? `<img src="${ref.dataUrl}" alt="">` : `<span>${ref.unavailable?"NO IMAGE":esc(slot.labelEn)}</span>`}
         </div>
         <div class="slot-actions">
-          <label class="slot-upload-btn">เพิ่ม/เปลี่ยนรูป<input data-slot-input="${slot.key}" type="file" accept="image/*" hidden /></label>
-          <input class="slot-note" data-slot-note="${slot.key}" placeholder="จุดสังเกตเพิ่ม (ถ้ามี) เช่น โลโก้อยู่ซ้ายบน / มีช่องซิปด้านใน 1 ช่อง" value="${esc(state.productRefs[slot.key]?.note || "")}" />
+          <label class="slot-upload-btn ${ref.unavailable?"disabled":""}">เพิ่ม/เปลี่ยนรูป<input data-slot-input="${slot.key}" type="file" accept="image/*" hidden ${ref.unavailable?"disabled":""}/></label>
+          <label class="no-image-row"><input data-slot-unavailable="${slot.key}" type="checkbox" ${ref.unavailable?"checked":""}/><span>ไม่มีภาพนี้</span><small>ระบบจะไม่เดามุม/รายละเอียดนี้</small></label>
+          <input class="slot-note" data-slot-note="${slot.key}" placeholder="จุดสังเกตเพิ่ม (ถ้ามี) เช่น โลโก้อยู่ซ้ายบน / มีช่องซิปด้านใน 1 ช่อง" value="${esc(ref.note || "")}" />
         </div>
       </div>
-    </div>
-  `).join("");
+    </div>`;
+  }).join("");
 
-  $$("[data-slot-input]").forEach(input=>{
-    input.addEventListener("change",async e=>{
-      const f=e.target.files?.[0];if(!f)return;
-      const key=e.target.dataset.slotInput;
-      state.productRefs[key] = state.productRefs[key] || {fileName:"",dataUrl:null,note:""};
-      state.productRefs[key].fileName = f.name;
-      state.productRefs[key].dataUrl = await fileToDataUrl(f);
-      renderTransitionPlanner();
+  $$('[data-slot-input]').forEach(input=>input.addEventListener("change",async e=>{
+    const f=e.target.files?.[0];if(!f)return;
+    const key=e.target.dataset.slotInput;
+    state.productRefs[key]=state.productRefs[key]||{fileName:"",dataUrl:null,note:"",unavailable:false};
+    state.productRefs[key].fileName=f.name;
+    state.productRefs[key].dataUrl=await fileToDataUrl(f);
+    state.productRefs[key].unavailable=false;
+    state.analysis=null;state.project=null;state.selectedHook=null;
     renderProductSlots();
-    });
-  });
-  $$("[data-slot-note]").forEach(input=>{
-    input.addEventListener("input",e=>{
-      const key=e.target.dataset.slotNote;
-      state.productRefs[key] = state.productRefs[key] || {fileName:"",dataUrl:null,note:""};
-      state.productRefs[key].note = e.target.value;
-    });
-  });
+  }));
+
+  $$('[data-slot-unavailable]').forEach(input=>input.addEventListener("change",e=>{
+    const key=e.target.dataset.slotUnavailable;
+    const prev=state.productRefs[key]||{note:""};
+    state.productRefs[key]={fileName:e.target.checked?"":(prev.fileName||""),dataUrl:e.target.checked?null:(prev.dataUrl||null),note:prev.note||"",unavailable:e.target.checked};
+    state.analysis=null;state.project=null;state.selectedHook=null;
+    renderProductSlots();
+  }));
+
+  $$('[data-slot-note]').forEach(input=>input.addEventListener("input",e=>{
+    const key=e.target.dataset.slotNote;
+    state.productRefs[key]=state.productRefs[key]||{fileName:"",dataUrl:null,note:"",unavailable:false};
+    state.productRefs[key].note=e.target.value;
+  }));
 }
 
 async function bindSceneInput(id, previewId, key){
@@ -386,7 +424,8 @@ function referenceManifest(){
   if(!profile) return {};
   const out = {};
   for(const slot of profile.slots){
-    out[`product_${slot.key}`]=state.productRefs[slot.key]?.fileName || `(${slot.labelTh} ยังไม่ได้ระบุชื่อไฟล์)`;
+    const ref=state.productRefs[slot.key];
+    out[`product_${slot.key}`]=ref?.unavailable ? `(ไม่มีภาพ: ${slot.labelTh})` : (ref?.fileName || `(${slot.labelTh} ยังไม่ได้ระบุชื่อไฟล์)`);
   }
   out.scene_table=state.sceneRefs.table.fileName || "table-review.png";
   out.scene_room=state.sceneRefs.room.fileName || "room-review.png";
@@ -467,32 +506,33 @@ renderTransitionPlanner();
 function validateRequiredSlots(){
   const profile=currentProfile();
   if(!profile){ toast("กรุณาเลือกหมวดสินค้าก่อน"); return false; }
-  const missing = profile.slots.filter(s=>s.required && !state.productRefs[s.key]?.dataUrl);
-  if(missing.length) {
-    toast(`ต้องใส่: ${missing.map(s=>s.labelTh).join(", ")}`);
-    return false;
-  }
+  const missing=profile.slots.filter(x=>x.required&&!state.productRefs[x.key]?.dataUrl&&!state.productRefs[x.key]?.unavailable);
+  if(missing.length){toast(`ช่องจำเป็นยังไม่ได้จัดการ: ${missing.map(x=>x.labelTh).join(", ")} · เพิ่มรูปหรือเลือก “ไม่มีภาพนี้”`);return false;}
   return true;
 }
 
 el.analyze.onclick=async()=>{
+  if(state.apiBusy)return;
+  if(state.cooldownUntil>Date.now()) return toast(`ยังอยู่ในช่วง cooldown · รออีกประมาณ ${Math.ceil((state.cooldownUntil-Date.now())/1000)} วินาที`);
   if(!validateRequiredSlots()) return;
   const profile=currentProfile();
-  const missingRecommended=(profile?.slots||[]).filter(s=>s.priority==="recommended"&&!state.productRefs[s.key]?.dataUrl);
-  if(missingRecommended.length){
-    const ok=confirm(`ยังไม่ได้แนบภาพที่แนะนำ:\n- ${missingRecommended.map(s=>s.labelTh).join("\n- ")}\n\nระบบทำต่อได้ แต่ความแม่นของสินค้า/มุม/สถานะอาจลดลง ต้องการวิเคราะห์ต่อหรือไม่?`);
-    if(!ok)return;
-  }
+  const missingRecommended=(profile?.slots||[]).filter(x=>x.priority==="recommended"&&!state.productRefs[x.key]?.dataUrl&&!state.productRefs[x.key]?.unavailable);
+  const unavailableImportant=(profile?.slots||[]).filter(x=>["required","recommended"].includes(x.priority)&&state.productRefs[x.key]?.unavailable);
+  const notices=[];
+  if(missingRecommended.length) notices.push(`ยังไม่ได้จัดการภาพแนะนำ:\n- ${missingRecommended.map(x=>x.labelTh).join("\n- ")}`);
+  if(unavailableImportant.length) notices.push(`ระบุว่าไม่มีภาพ:\n- ${unavailableImportant.map(x=>x.labelTh).join("\n- ")}\nระบบจะหลีกเลี่ยงมุมที่ต้องใช้ภาพเหล่านี้`);
+  if(notices.length&&!confirm(`${notices.join("\n\n")}\n\nต้องการวิเคราะห์ต่อหรือไม่?`))return;
+  setApiBusy(true);
   showLoading("กำลังวิเคราะห์สินค้า…","อ่านรายละเอียดตาม Reference Role + สร้าง Product State Map + Hook Lab");
   try{
     const r=await fetch("/api/analyze",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(formBase())});
-    const data=await r.json();if(!r.ok) throw new Error(data.error||`HTTP ${r.status}`);
-    state.analysis=data.analysis;
-    state.selectedHook=null;
-    localStorage.setItem("basketclip:v06:analysis",JSON.stringify({analysis:state.analysis,category:$("#category").value,productRefs:state.productRefs,sceneRefs:state.sceneRefs}));
-    renderAnalysis();setStep(2);toast(`วิเคราะห์สำเร็จ · ${data.geminiModel}`);
-  }catch(err){toast(String(err.message||err).slice(0,220));el.empty.classList.remove("hidden")}
-  finally{hideLoading();}
+    const data=await r.json();
+    if(!r.ok){if(data.retryAfterSec)startCooldown(data.retryAfterSec);throw new Error(data.error||`HTTP ${r.status}`);}
+    state.analysis=data.analysis;state.selectedHook=null;
+    localStorage.setItem("basketclip:v065:analysis",JSON.stringify({analysis:state.analysis,category:$("#category").value,productRefs:state.productRefs,sceneRefs:state.sceneRefs}));
+    renderAnalysis();setStep(2);toast(`วิเคราะห์สำเร็จ · ${data.geminiModel}${data.fallbackUsed?" · fallback":""}${data.attempts>1?` · ${data.attempts} attempts`:""}`);
+  }catch(err){toast(friendlyApiError(err));if(state.analysis){renderAnalysis();setStep(2);}else el.empty.classList.remove("hidden");}
+  finally{hideLoading();setApiBusy(false);}
 };
 
 function renderAnalysis(){
@@ -516,10 +556,11 @@ function renderAnalysis(){
   el.projectView.classList.add("hidden");
   el.analysisView.innerHTML=`
     <section class="card ${readiness.score>=80?"good":""}">
-      <div class="card-head"><h3>Readiness</h3><span class="score">${readiness.score??"—"}/100</span></div>
-      <p>${(readiness.warnings_th||[]).length?`<b style="color:#8a5a0f">ข้อควรระวัง</b>`:"พร้อมสำหรับขั้นเลือก Hook"}</p>
+      <div class="card-head"><h3>Reference Coverage</h3><span class="score">${readiness.score??"—"}/100</span></div>
+      <p><b>${readiness.workflowReady===false?"ยังไม่พร้อม":"พร้อมสำหรับขั้นเลือก Hook"}</b> · มีภาพจริง ${readiness.uploadedCount??"—"}/${readiness.totalSlots??"—"} ช่อง${(readiness.unavailableRoles||[]).length?` · ไม่มีภาพ ${(readiness.unavailableRoles||[]).length} ช่อง`:""}</p>
       ${(readiness.warnings_th||[]).length?`<ul class="warning-list">${li(readiness.warnings_th)}</ul>`:""}
-      ${(readiness.recommendedExtraReferences_th||[]).length?`<div class="detail-box" style="margin-top:8px"><b>แนะนำให้เพิ่มภาพ</b><ul>${li(readiness.recommendedExtraReferences_th)}</ul></div>`:""}${(a.continuityDirectorNotes_th||[]).length?`<div class="detail-box" style="margin-top:8px"><b>Continuity notes</b><ul>${li(a.continuityDirectorNotes_th)}</ul></div>`:""}
+      ${(readiness.recommendedExtraReferences_th||[]).length?`<div class="detail-box" style="margin-top:8px"><b>แนะนำให้เพิ่มภาพ</b><ul>${li(readiness.recommendedExtraReferences_th)}</ul></div>`:""}
+      ${readiness.aiAssessmentScore!=null?`<div class="subnote"><b>AI assessment:</b> ${esc(readiness.aiAssessmentScore)}/100 · ใช้เป็นความเห็นประกอบเท่านั้น คะแนนหลักด้านบนคำนวณจาก Reference ที่แนบจริง</div>`:""}${(a.continuityDirectorNotes_th||[]).length?`<div class="detail-box" style="margin-top:8px"><b>Continuity notes</b><ul>${li(a.continuityDirectorNotes_th)}</ul></div>`:""}
     </section>
 
     <section class="card">
@@ -582,7 +623,10 @@ function renderAnalysis(){
 }
 
 async function buildProject(){
+  if(state.apiBusy)return;
+  if(state.cooldownUntil>Date.now()) return toast(`ยังอยู่ในช่วง cooldown · รออีกประมาณ ${Math.ceil((state.cooldownUntil-Date.now())/1000)} วินาที`);
   if(!state.selectedHook) return toast("เลือก Hook ก่อน");
+  setApiBusy(true);
   showLoading("กำลัง Compile Production Prompts…","ใส่ Product Lock + Role Map + Scene Reference + Continuity ลงทุกคลิป");
   try{
     const r=await fetch("/api/build-project",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({
@@ -591,16 +635,16 @@ async function buildProject(){
       selectedHook: state.selectedHook,
       referenceManifest: referenceManifest(),
     })});
-    const data=await r.json();if(!r.ok)throw new Error(data.error||`HTTP ${r.status}`);
+    const data=await r.json();if(!r.ok){if(data.retryAfterSec)startCooldown(data.retryAfterSec);throw new Error(data.error||`HTTP ${r.status}`);}
     state.project=data.project;
-    localStorage.setItem("basketclip:v06:project",JSON.stringify({
+    localStorage.setItem("basketclip:v065:project",JSON.stringify({
       analysis:state.analysis,project:state.project,selectedHook:state.selectedHook,
       referenceManifest:referenceManifest(),category:$("#category").value,productRefs:state.productRefs,sceneRefs:state.sceneRefs,
       transitionPrefs:state.transitionPrefs,clipArtifacts:state.clipArtifacts
     }));
     renderProject();setStep(3);el.exportPack.disabled=false;el.exportJson.disabled=false;toast(`Production Pack พร้อม · ${data.geminiModel}`);
-  }catch(err){toast(String(err.message||err).slice(0,220));renderAnalysis()}
-  finally{hideLoading();}
+  }catch(err){toast(friendlyApiError(err));renderAnalysis()}
+  finally{hideLoading();setApiBusy(false);}
 }
 
 
@@ -799,7 +843,7 @@ async function reinforceClip(id){
     renderProject();
     toast(`วิเคราะห์ Frame DNA + เสริม continuity ให้ Clip ${id} แล้ว`);
   }catch(err){
-    toast(String(err.message||err).slice(0,220));
+    toast(friendlyApiError(err));
   }finally{ hideLoading(); }
 }
 
@@ -820,7 +864,7 @@ el.reviseSubmit.onclick=async()=>{
     const idx=state.project.clips.findIndex(x=>Number(x.id)===Number(state.reviseClipId));
     if(idx>=0)state.project.clips[idx]=data.clip;
     el.modal.classList.add("hidden");saveCurrentProjectState();renderProject();toast("แก้ Clip แล้ว โดยคง Product Lock + Continuity");
-  }catch(err){toast(String(err.message||err).slice(0,200))}
+  }catch(err){toast(friendlyApiError(err))}
   finally{el.reviseSubmit.disabled=false;el.reviseSubmit.textContent="แก้ Clip นี้"}
 };
 
@@ -830,7 +874,7 @@ function download(name,text,type="text/plain"){
 }
 el.exportJson.onclick=()=>{
   if(!state.project)return;
-  download("basketclip-v063-project.json",JSON.stringify({
+  download("basketclip-v064-project.json",JSON.stringify({
     category: $("#category").value,
     categoryProfile: currentProfile(),
     referenceManifest:referenceManifest(),
@@ -843,7 +887,7 @@ el.exportPack.onclick=()=>{
   if(!state.project)return;
   const p=state.project;
   const md=[
-    "# BasketClip v0.6.3 — Google Flow Agent Production Pack","",
+    "# BasketClip v0.6.4 — Google Flow Agent Production Pack","",
     "## 0. CATEGORY", $("#category").value, "",
     "## 1. REFERENCE MANIFEST","```",manifestText(),"```","",
     "## 2. SELECTED HOOK",p.selectedHook?.hook_th||state.selectedHook?.hook_th||"","",
@@ -870,12 +914,12 @@ el.exportPack.onclick=()=>{
     "## 7. SCENEBUILDER ORDER",(p.scenebuilderOrder||[]).join(" -> "),"",
     "## 8. CAPTION",p.caption_th||"","",(p.hashtags||[]).join(" ")
   ].join("\n");
-  download("basketclip-v063-flow-agent-pack.md",md,"text/markdown");
+  download("basketclip-v064-flow-agent-pack.md",md,"text/markdown");
 };
 
 function restoreSaved(){
   try{
-    const saved=JSON.parse(localStorage.getItem("basketclip:v06:project")||"null");
+    const saved=JSON.parse(localStorage.getItem("basketclip:v065:project")||"null");
     if(saved?.category) $("#category").value=saved.category;
     renderCategoryGuide();
     renderProductSlots();

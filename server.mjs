@@ -148,52 +148,103 @@ async function resolveGeminiModel(requestedModel) {
   return { model: requestedModel || GEMINI_MODEL_DEFAULT, available };
 }
 
+const TRANSIENT_GEMINI_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+function parseRetryAfterMs(value) {
+  if (!value) return 0;
+  const n = Number(value);
+  if (Number.isFinite(n) && n > 0) return Math.min(n * 1000, 60000);
+  const t = Date.parse(value);
+  if (Number.isFinite(t)) return Math.max(0, Math.min(t - Date.now(), 60000));
+  return 0;
+}
+
+function overloadDelayMs(attemptIndex, retryAfterHeader = null) {
+  const h = parseRetryAfterMs(retryAfterHeader);
+  if (h) return h;
+  return Math.min(1500 * (2 ** attemptIndex), 12000) + Math.floor(Math.random() * 900);
+}
+
+function rateLimitDelayMs(attemptIndex, retryAfterHeader = null) {
+  const h = parseRetryAfterMs(retryAfterHeader);
+  if (h) return h;
+  const seq = [8000, 18000];
+  return seq[Math.min(attemptIndex, seq.length - 1)] + Math.floor(Math.random() * 1500);
+}
+
+function readApiMessage(raw) {
+  try { const p = JSON.parse(raw || "{}"); return p?.error?.message || p?.message || ""; }
+  catch { return ""; }
+}
+
+function friendlyGeminiError(status, modelId, raw, attempts, retryAfterMs = 0) {
+  const message = readApiMessage(raw);
+  if (status === 503) {
+    const err = new Error(`Gemini ฝั่ง Google กำลังโหลดสูงชั่วคราว (503). ระบบลองซ้ำและสลับโมเดลที่รองรับแล้ว ${attempts} ครั้ง แต่ยังไม่สำเร็จ กรุณารอ 30–60 วินาทีแล้วลองใหม่${message ? ` — ${message}` : ""}`);
+    err.statusCode = 503; err.code = "GEMINI_OVERLOADED"; err.retryAfterSec = 45; return err;
+  }
+  if (status === 429) {
+    const suggested = Math.max(15, Math.ceil((retryAfterMs || 15000) / 1000));
+    const err = new Error(`Gemini API ถึงขีดจำกัดอัตราการใช้งานชั่วคราว (429 RATE LIMIT). อย่ากดซ้ำถี่ ๆ เพราะอาจเป็น RPM/TPM ของโปรเจกต์ กรุณารอประมาณ ${suggested} วินาทีแล้วลองขั้นตอนเดิมอีกครั้ง${message ? ` — ${message}` : ""}`);
+    err.statusCode = 429; err.code = "GEMINI_RATE_LIMIT"; err.retryAfterSec = suggested; return err;
+  }
+  const err = new Error(`Gemini API error (${modelId}, HTTP ${status}): ${(message || raw || "Unknown error").slice(0, 2200)}`);
+  err.statusCode = status || 502; err.retryAfterSec = 0; return err;
+}
+
+function rankFallbackModels(available = [], requestedModel = "") {
+  const ids = available.map(x => x.id).filter(id => /^gemini-/i.test(id));
+  const order = [requestedModel, GEMINI_MODEL_DEFAULT, ...PREFERRED_MODELS, ...ids.filter(id => /flash-lite/i.test(id)), ...ids.filter(id => /flash/i.test(id) && !/flash-lite/i.test(id)), ...ids.filter(id => /pro/i.test(id))].filter(Boolean);
+  return [...new Set(order)].filter(id => !ids.length || ids.includes(id));
+}
+
 async function callGemini({ model, parts, maxOutputTokens = 12000 }) {
   const resolved = await resolveGeminiModel(model);
-  let activeModel = resolved.model;
+  const candidateModels = rankFallbackModels(resolved.available || [], resolved.model || model);
+  if (!candidateModels.length) candidateModels.push(resolved.model || model || GEMINI_MODEL_DEFAULT);
 
   async function runOnce(modelId) {
-    return await fetch(
-      `${GEMINI_BASE}/models/${encodeURIComponent(modelId)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts }],
-          generationConfig: {
-            maxOutputTokens,
-            responseMimeType: "application/json",
-          },
-        }),
-      }
-    );
+    return await fetch(`${GEMINI_BASE}/models/${encodeURIComponent(modelId)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ contents: [{ role: "user", parts }], generationConfig: { maxOutputTokens, responseMimeType: "application/json" } }),
+    });
   }
 
-  let r = await runOnce(activeModel);
-  let raw = await r.text();
-
-  if (!r.ok && r.status === 404) {
-    const availableIds = new Set((resolved.available || []).map(m => m.id));
-    const fallback = PREFERRED_MODELS.find(id => id !== activeModel && (!availableIds.size || availableIds.has(id)));
-    if (fallback) {
-      activeModel = fallback;
-      r = await runOnce(activeModel);
-      raw = await r.text();
+  let totalAttempts = 0, lastStatus = 0, lastRaw = "", lastModel = candidateModels[0], lastRetryAfterMs = 0;
+  for (let modelIndex = 0; modelIndex < Math.min(candidateModels.length, 4); modelIndex++) {
+    const activeModel = candidateModels[modelIndex]; lastModel = activeModel;
+    let overloadAttempt = 0, rateLimitAttempt = 0;
+    while (true) {
+      totalAttempts += 1;
+      let r, raw;
+      try { r = await runOnce(activeModel); raw = await r.text(); }
+      catch (networkErr) {
+        lastStatus = 503; lastRaw = String(networkErr?.message || networkErr);
+        if (overloadAttempt < 2) { await sleep(overloadDelayMs(overloadAttempt++)); continue; }
+        break;
+      }
+      lastStatus = r.status; lastRaw = raw;
+      if (r.ok) {
+        let parsed; try { parsed = JSON.parse(raw); } catch { throw new Error("อ่านคำตอบ Gemini ไม่สำเร็จ"); }
+        const text = parsed?.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("") || "";
+        try { return { data: JSON.parse(stripJsonFence(text)), model: activeModel, attempts: totalAttempts, fallbackUsed: activeModel !== (resolved.model || model) }; }
+        catch { throw new Error(`Gemini ตอบกลับมาไม่ใช่ JSON ที่สมบูรณ์: ${text.slice(0, 3000)}`); }
+      }
+      if (r.status === 404) break;
+      if (!TRANSIENT_GEMINI_STATUSES.has(r.status)) throw friendlyGeminiError(r.status, activeModel, raw, totalAttempts, 0);
+      if (r.status === 429) {
+        lastRetryAfterMs = rateLimitDelayMs(rateLimitAttempt, r.headers.get("retry-after"));
+        if (modelIndex === 0 && rateLimitAttempt < 1) { await sleep(lastRetryAfterMs); rateLimitAttempt += 1; continue; }
+        throw friendlyGeminiError(429, activeModel, raw, totalAttempts, lastRetryAfterMs);
+      }
+      if (overloadAttempt < (modelIndex === 0 ? 3 : 1)) { await sleep(overloadDelayMs(overloadAttempt++, r.headers.get("retry-after"))); continue; }
+      break;
     }
   }
-
-  if (!r.ok) throw new Error(`Gemini API error (${activeModel}): ${raw.slice(0, 2400)}`);
-
-  let parsed;
-  try { parsed = JSON.parse(raw); }
-  catch { throw new Error("อ่านคำตอบ Gemini ไม่สำเร็จ"); }
-
-  const text = parsed?.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("") || "";
-  try {
-    return { data: JSON.parse(stripJsonFence(text)), model: activeModel };
-  } catch {
-    throw new Error(`Gemini ตอบกลับมาไม่ใช่ JSON ที่สมบูรณ์: ${text.slice(0, 3000)}`);
-  }
+  throw friendlyGeminiError(lastStatus, lastModel, lastRaw, totalAttempts, lastRetryAfterMs);
 }
 
 function presenterText(gender) {
@@ -394,13 +445,14 @@ function buildProductParts(profile = {}, productRefs = {}) {
   const parts = [];
   for (const slot of (profile.slots || [])) {
     const ref = productRefs?.[slot.key];
+    const note = ref?.note ? `User note: ${ref.note}` : "User note: (none)";
+    if (ref?.unavailable === true && !ref?.dataUrl) {
+      parts.push({ text: `PRODUCT REFERENCE SLOT ${slot.key.toUpperCase()} — ${slot.labelEn}: USER CONFIRMED NO IMAGE AVAILABLE. ${note}. Treat details unique to this view/state as UNKNOWN. Do not invent, mirror, reconstruct, or require this unsupported view in later clips.` });
+      continue;
+    }
     const inline = dataUrlToInlineData(ref?.dataUrl);
     if (!inline) continue;
-    const note = ref?.note ? `User note: ${ref.note}` : "User note: (none)";
-    parts.push(
-      { text: `PRODUCT REFERENCE SLOT ${slot.key.toUpperCase()} — ${slot.labelEn}. Role meaning: ${slot.helpEn}. ${note}` },
-      { inlineData: inline }
-    );
+    parts.push({ text: `PRODUCT REFERENCE SLOT ${slot.key.toUpperCase()} — ${slot.labelEn}. Role meaning: ${slot.helpEn}. ${note}` }, { inlineData: inline });
   }
   return parts;
 }
@@ -413,6 +465,39 @@ function manifestLabelMap(profile = {}, manifest = {}) {
   out.scene_table = manifest.scene_table || "Scene A โต๊ะรีวิว";
   out.scene_room = manifest.scene_room || "Scene B ห้องรีวิว";
   return out;
+}
+
+function refAvailability(ref) {
+  if (ref?.dataUrl) return "image";
+  if (ref?.unavailable === true) return "unavailable";
+  return "missing";
+}
+
+function computeReferenceCoverage(profile = {}, productRefs = {}) {
+  const slots = profile.slots || [];
+  const groups = {
+    required: slots.filter(s => s.priority === "required" || s.required),
+    recommended: slots.filter(s => !s.required && s.priority === "recommended"),
+    optional: slots.filter(s => !s.required && s.priority === "optional"),
+  };
+  const weights = { required: 60, recommended: 30, optional: 10 };
+  const active = Object.entries(groups).reduce((sum,[k,v]) => sum + (v.length ? weights[k] : 0), 0) || 100;
+  let score = 0; const breakdown = {};
+  for (const [name, group] of Object.entries(groups)) {
+    if (!group.length) continue;
+    const per = (weights[name] * (100 / active)) / group.length;
+    let imageCount=0, unavailableCount=0, missingCount=0;
+    for (const slot of group) {
+      const st = refAvailability(productRefs?.[slot.key]);
+      if (st === "image") { score += per; imageCount += 1; }
+      else if (st === "unavailable") unavailableCount += 1;
+      else missingCount += 1;
+    }
+    breakdown[name] = { total: group.length, imageCount, unavailableCount, missingCount };
+  }
+  const unresolved = groups.required.filter(s => refAvailability(productRefs?.[s.key]) === "missing");
+  const unavailable = slots.filter(s => refAvailability(productRefs?.[s.key]) === "unavailable");
+  return { score: Math.round(Math.max(0, Math.min(100, score))), workflowReady: unresolved.length === 0, breakdown, unresolvedRequired: unresolved.map(s=>s.labelTh), unavailableRoles: unavailable.map(s=>s.labelTh), uploadedCount: slots.filter(s=>refAvailability(productRefs?.[s.key]) === "image").length, totalSlots: slots.length };
 }
 
 async function analyzeProduct(req, res) {
@@ -433,22 +518,17 @@ async function analyzeProduct(req, res) {
     sceneRefs = {},
   } = body;
 
-  const required = requiredSlots(categoryProfile);
-  const provided = providedSlots(productRefs);
-  const missing = required.filter(x => !provided.includes(x));
-  if (missing.length) {
-    const missingLabels = (categoryProfile.slots || [])
-      .filter(s => missing.includes(s.key))
-      .map(s => s.labelTh);
-    return sendJson(res, 400, { error: `กรุณาแนบภาพอ้างอิงที่จำเป็นก่อน: ${missingLabels.join(", ")}` });
+  const coverage = computeReferenceCoverage(categoryProfile, productRefs);
+  if (!coverage.workflowReady) {
+    return sendJson(res, 400, { error: `ช่องภาพจำเป็นยังไม่ได้จัดการ: ${coverage.unresolvedRequired.join(", ")} — กรุณาอัปโหลดรูป หรือเลือก “ไม่มีภาพนี้”` });
   }
 
   const sceneTable = await sceneInline(sceneRefs?.table?.dataUrl, "table");
   const sceneRoom = await sceneInline(sceneRefs?.room?.dataUrl, "room");
   const roleSummary = (categoryProfile.slots || []).map(s => {
-    const have = productRefs?.[s.key]?.dataUrl ? "provided" : "not provided";
+    const have = refAvailability(productRefs?.[s.key]);
     const note = productRefs?.[s.key]?.note || "(none)";
-    return `- ${s.key} | ${s.labelEn} | required=${Boolean(s.required)} | ${have} | note=${note}`;
+    return `- ${s.key} | ${s.labelEn} | required=${Boolean(s.required)} | status=${have} | note=${note}`;
   }).join("\n");
 
   const prompt = `
@@ -469,6 +549,11 @@ Presenter: ${presenterText(presenterGender)}
 
 REFERENCE SLOT DECLARATIONS
 ${roleSummary}
+
+REFERENCE AVAILABILITY POLICY
+- status=image: supplied and analyzable.
+- status=unavailable: user explicitly has no image. Never invent, mirror, reconstruct, or plan a shot that depends on this view/state.
+- status=missing: no decision supplied. Do not pretend it exists.
 
 ${categoryGuidelines(categoryProfile)}
 
@@ -575,9 +660,11 @@ Return VALID JSON ONLY:
         { inlineData: sceneRoom },
       ],
     });
-    return sendJson(res, 200, { analysis: result.data, geminiModel: result.model });
+    const aiReadiness = result.data?.readiness || {};
+    result.data.readiness = { ...aiReadiness, aiAssessmentScore: aiReadiness.score ?? null, score: coverage.score, workflowReady: coverage.workflowReady, coverageBreakdown: coverage.breakdown, uploadedCount: coverage.uploadedCount, totalSlots: coverage.totalSlots, unavailableRoles: coverage.unavailableRoles, scoringMethod: "deterministic_reference_coverage_v1" };
+    return sendJson(res, 200, { analysis: result.data, geminiModel: result.model, attempts: result.attempts, fallbackUsed: result.fallbackUsed });
   } catch (err) {
-    return sendJson(res, 502, { error: String(err.message || err) });
+    return sendJson(res, Number(err.statusCode) || 502, { error: String(err.message || err), code: err.code || null, retryAfterSec: err.retryAfterSec || 0 });
   }
 }
 
@@ -617,6 +704,7 @@ async function buildProject(req, res) {
     labelEn: s.labelEn,
     required: Boolean(s.required),
     supplied: Boolean(productRefs?.[s.key]?.dataUrl),
+    unavailable: Boolean(productRefs?.[s.key]?.unavailable),
     helpEn: s.helpEn,
   }));
 
@@ -859,7 +947,7 @@ ${JSON.stringify(analysis)}
 
     return sendJson(res, 200, { project, geminiModel: generated.model });
   } catch (err) {
-    return sendJson(res, 502, { error: String(err.message || err) });
+    return sendJson(res, Number(err.statusCode) || 502, { error: String(err.message || err), code: err.code || null, retryAfterSec: err.retryAfterSec || 0 });
   }
 }
 
@@ -909,7 +997,7 @@ Return VALID JSON ONLY:
     });
     return sendJson(res, 200, { clip: revised.data.clip });
   } catch (err) {
-    return sendJson(res, 502, { error: String(err.message || err) });
+    return sendJson(res, Number(err.statusCode) || 502, { error: String(err.message || err), code: err.code || null, retryAfterSec: err.retryAfterSec || 0 });
   }
 }
 
@@ -1152,7 +1240,7 @@ Return VALID JSON ONLY:
       compilerModel: revised.model,
     });
   } catch (err) {
-    return sendJson(res, 502, { error: String(err.message || err) });
+    return sendJson(res, Number(err.statusCode) || 502, { error: String(err.message || err), code: err.code || null, retryAfterSec: err.retryAfterSec || 0 });
   }
 }
 
@@ -1167,7 +1255,7 @@ async function apiModels(req, res) {
       defaultModel: preferred[0] || models[0]?.id || GEMINI_MODEL_DEFAULT,
     });
   } catch (err) {
-    return sendJson(res, 502, { error: String(err.message || err) });
+    return sendJson(res, Number(err.statusCode) || 502, { error: String(err.message || err), code: err.code || null, retryAfterSec: err.retryAfterSec || 0 });
   }
 }
 
@@ -1216,7 +1304,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`BasketClip Director v0.6.3: http://localhost:${PORT}`);
+  console.log(`BasketClip Director v0.6.5: http://localhost:${PORT}`);
   console.log(`Gemini key: ${GEMINI_API_KEY ? "configured" : "NOT configured"}`);
   console.log(`Gemini default model: ${GEMINI_MODEL_DEFAULT}`);
 });

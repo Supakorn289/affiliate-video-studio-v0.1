@@ -1,4 +1,4 @@
-# BasketClip Director v0.6.3.1
+# BasketClip Director v0.6.5.1
 
 เวอร์ชันนี้แก้จุดสำคัญจาก v0.5 ตามข้อเสนอ:
 
@@ -226,4 +226,21 @@ BC_01 generate
 ```
 
 Master Agent Pack ยังใช้ได้สำหรับ batch แต่ Sequential Fidelity Mode จะต่อเนื่องกว่าเพราะใช้ผลลัพธ์จริงของคลิปก่อนหน้า
-"# affiliate-video-studio-v0.1" 
+
+
+## v0.6.5 — Gemini overload resilience
+
+เพิ่ม automatic retry สำหรับ 408/429/5xx ตามแนวทาง exponential backoff + jitter และ fallback ไปโมเดล Gemini ที่ API key ใช้งานได้ หากโมเดลหลักตอบ 503 ชั่วคราว.
+
+ลำดับโดยย่อ:
+- โมเดลที่เลือก: สูงสุด 3 attempts
+- fallback ตัวถัดไป: สูงสุด 2 attempts
+- fallback ตัวถัดไป: 1 attempt
+- ถ้ายัง 503: แสดงข้อความภาษาไทยว่าฝั่ง Google มี high demand และแนะนำรอ 30–60 วินาที
+
+
+## v0.6.5
+- Separate 429 rate-limit handling from 503 overload
+- Conservative cooldown on 429
+- Deterministic Reference Coverage score
+- Restored “ไม่มีภาพนี้” for every reference slot
